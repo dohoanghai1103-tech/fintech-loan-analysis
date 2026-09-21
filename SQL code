@@ -1,0 +1,332 @@
+                            SQL code 
+-- ============================================================
+-- PHẦN 1: VALIDATE DATA
+-- ============================================================
+
+-- 1.1 Validate grain (mỗi bảng có bị trùng application_id không)
+SELECT count(application_id), count(distinct application_id)
+FROM case1_finance.loan_application;
+
+SELECT count(application_id), count(distinct application_id)
+FROM case1_finance.loan_disbursement;
+
+SELECT count(application_id), count(distinct application_id)
+FROM case1_finance.credit_assessment;
+
+-- 1.2 Validate date range
+SELECT min(application_date::date), max(application_date::date)
+FROM case1_finance.loan_application;
+
+SELECT min(disbursed_date::date), max(disbursed_date::date)
+FROM case1_finance.loan_disbursement
+WHERE disbursed_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$';
+
+SELECT min("date"::date), max("date"::date)
+FROM case1_finance.marketing_performance;
+
+-- 1.3 Validate Applications theo quý (kỳ vọng Q1=100,000, Q2=135,000)
+SELECT la.quarter, count(la.application_id) AS applications
+FROM case1_finance.loan_application la
+GROUP BY la.quarter;
+
+-- 1.4 Validate Disbursed Value theo quý (kỳ vọng Q1≈2,400 tỷ, Q2≈2,045 tỷ)
+SELECT la.quarter, sum(ld.disbursed_amount) AS total_disbursed
+FROM case1_finance.loan_application la
+LEFT JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+GROUP BY la.quarter;
+
+-- 1.5 Validate Marketing Spend theo quý (kỳ vọng Q1=20 tỷ, Q2=25 tỷ)
+SELECT quarter, sum(spend) AS total_spend
+FROM case1_finance.marketing_performance
+GROUP BY quarter;
+
+-- 1.6 Validate missing mapping (orphan records)
+SELECT la.application_id
+FROM case1_finance.loan_application la
+LEFT JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+WHERE ca.application_id IS NULL;
+
+SELECT la.application_id
+FROM case1_finance.loan_application la
+LEFT JOIN case1_finance.customer_profile cp ON la.customer_id = cp.customer_id
+WHERE cp.customer_id IS NULL;
+
+-- 1.7 Validate funnel logic (5 test bất thường)
+-- (a) rejected nhưng approved_limit > 0
+SELECT * FROM case1_finance.credit_assessment
+WHERE approval_status = 'rejected' AND approved_limit > 0;
+
+-- (b) approved nhưng approved_limit = 0
+SELECT * FROM case1_finance.credit_assessment
+WHERE approval_status = 'approved' AND approved_limit = 0;
+
+-- (c) rejected nhưng đã disbursed
+SELECT *
+FROM case1_finance.loan_application la
+LEFT JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+LEFT JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+WHERE ca.approval_status = 'rejected' AND ld.disbursed_flag = 1;
+
+-- (d) disbursed_amount > approved_limit
+SELECT ca.application_id, ca.approved_limit, ld.disbursed_amount
+FROM case1_finance.credit_assessment ca
+LEFT JOIN case1_finance.loan_disbursement ld ON ca.application_id = ld.application_id
+WHERE ld.disbursed_flag = 1 AND ld.disbursed_amount > ca.approved_limit;
+
+-- (e) disbursed_date < application_date
+SELECT la.application_id, la.application_date, ld.disbursed_date
+FROM case1_finance.loan_application la
+LEFT JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+WHERE ld.disbursed_flag = 1 AND ld.disbursed_date < la.application_date;
+
+-- 1.8 Range check
+SELECT min(credit_score), max(credit_score) FROM case1_finance.credit_assessment;
+
+SELECT count(*) FROM case1_finance.customer_profile WHERE monthly_income <= 0;
+
+SELECT count(*) FROM case1_finance.loan_application WHERE requested_amount <= 0;
+
+SELECT min(age), max(age) FROM case1_finance.customer_profile;
+
+-- 1.9 Customer_id có trùng trong loan_application không (ảnh hưởng New/Existing mix)
+SELECT customer_id, count(*)
+FROM case1_finance.loan_application
+GROUP BY customer_id
+HAVING count(*) > 1;
+
+
+-- ============================================================
+-- PHẦN 2: RIGHT-CENSORING CHECK (loại trừ nhiễu đo lường)
+-- ============================================================
+
+SELECT 
+    CASE WHEN la.application_date::date >= '2025-06-15' THEN '2 tuần cuối Q2' ELSE 'Còn lại của Q2' END AS submission_window,
+    COUNT(DISTINCT la.application_id) AS total_approved,
+    SUM(ld.disbursed_flag) AS total_disbursed,
+    ROUND(SUM(ld.disbursed_flag)::numeric / COUNT(DISTINCT la.application_id) * 100, 1) AS disbursement_rate_pct
+FROM case1_finance.loan_application la
+JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+WHERE la.quarter = 'Q2' AND ca.approval_status = 'Approved'
+GROUP BY 1;
+
+
+-- ============================================================
+-- PHẦN 3: UNIVARIATE SCREENING (8 nhánh: A2, B1, B2, B4, C1-C5, D1, D3)
+-- ============================================================
+
+-- A2. Channel Mix — Applications & Approval Rate theo channel
+SELECT 
+    la.quarter, la.acquisition_channel,
+    COUNT(la.application_id) AS applications,
+    SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END) AS approved,
+    ROUND(SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END)::numeric 
+          / COUNT(la.application_id) * 100, 1) AS approval_rate_pct
+FROM case1_finance.loan_application la
+LEFT JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+GROUP BY la.quarter, la.acquisition_channel
+ORDER BY la.acquisition_channel, la.quarter;
+
+-- B1. Risk Profile — avg credit_score theo risk_band & quarter
+SELECT la.quarter, ca.risk_band, ROUND(AVG(ca.credit_score), 0) AS avg_credit_score, COUNT(*) AS count_applications
+FROM case1_finance.loan_application la
+JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+GROUP BY la.quarter, ca.risk_band
+ORDER BY ca.risk_band, la.quarter;
+
+-- B1 (tổng quan, không tách risk_band)
+SELECT la.quarter, ROUND(AVG(ca.credit_score),0) AS avg_credit_score
+FROM case1_finance.loan_application la
+JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+GROUP BY la.quarter;
+
+-- B2. Customer Segment Mix
+SELECT 
+    la.quarter, cp.customer_type,
+    COUNT(la.application_id) AS applications,
+    SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END) AS approved,
+    ROUND(SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END)::numeric 
+          / COUNT(la.application_id) * 100, 1) AS approval_rate_pct
+FROM case1_finance.loan_application la
+JOIN case1_finance.customer_profile cp ON la.customer_id = cp.customer_id
+LEFT JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+GROUP BY la.quarter, cp.customer_type
+ORDER BY cp.customer_type, la.quarter;
+
+-- B4. Risk Policy — rejection_reason theo quarter
+SELECT la.quarter, ca.rejection_reason, COUNT(*) AS count_rejected
+FROM case1_finance.loan_application la
+JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+WHERE ca.approval_status = 'Rejected'
+GROUP BY la.quarter, ca.rejection_reason
+ORDER BY ca.rejection_reason, la.quarter;
+
+-- C1-C5. Non-disbursement reason theo quarter
+SELECT la.quarter, ld.non_disbursement_reason, COUNT(*) AS count_not_disbursed
+FROM case1_finance.loan_application la
+JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+WHERE ca.approval_status = 'Approved' AND ld.disbursed_flag = 0
+GROUP BY la.quarter, ld.non_disbursement_reason
+ORDER BY ld.non_disbursement_reason, la.quarter;
+
+-- D1. Income Mix (percentile để chọn ngưỡng khách quan)
+SELECT 
+    percentile_cont(0.33) WITHIN GROUP (ORDER BY monthly_income) AS p33,
+    percentile_cont(0.66) WITHIN GROUP (ORDER BY monthly_income) AS p66
+FROM case1_finance.customer_profile;
+
+-- D1. Income Segment Mix (dùng ngưỡng p33/p66 vừa tính: 14.8tr / 24.8tr)
+WITH income_bucket AS (
+    SELECT 
+        la.quarter, la.application_id, cp.monthly_income,
+        CASE 
+            WHEN cp.monthly_income >= 24800000 THEN 'High income'
+            WHEN cp.monthly_income >= 14800000 THEN 'Medium income'
+            ELSE 'Low income'
+        END AS income_segment
+    FROM case1_finance.loan_application la
+    JOIN case1_finance.customer_profile cp ON la.customer_id = cp.customer_id
+    JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+    WHERE ld.disbursed_flag = 1
+)
+SELECT 
+    quarter, income_segment, COUNT(*) AS count_disbursed,
+    ROUND(COUNT(*)::numeric / SUM(COUNT(*)) OVER (PARTITION BY quarter) * 100, 1) AS pct_of_quarter
+FROM income_bucket
+GROUP BY quarter, income_segment
+ORDER BY quarter, income_segment;
+
+-- D1 xác nhận confounding với B2 (Income Segment × Customer Type)
+SELECT 
+    la.quarter, cp.customer_type,
+    CASE 
+        WHEN cp.monthly_income >= 24800000 THEN 'High income'
+        WHEN cp.monthly_income >= 14800000 THEN 'Medium income'
+        ELSE 'Low income'
+    END AS income_segment,
+    COUNT(*) AS count_disbursed
+FROM case1_finance.loan_application la
+JOIN case1_finance.customer_profile cp ON la.customer_id = cp.customer_id
+JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+WHERE ld.disbursed_flag = 1
+GROUP BY la.quarter, cp.customer_type, income_segment
+ORDER BY la.quarter, cp.customer_type, income_segment;
+
+-- D3. Approved Limit
+SELECT la.quarter, ROUND(AVG(ca.approved_limit), 0) AS avg_approved_limit
+FROM case1_finance.loan_application la
+JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+WHERE ca.approval_status = 'Approved'
+GROUP BY la.quarter;
+
+
+-- ============================================================
+-- PHẦN 4: XÁC NHẬN CONFOUNDING A2 × B2 (TikTok = 100% New Customer)
+-- ============================================================
+
+SELECT la.acquisition_channel, cp.customer_type, COUNT(la.application_id) AS applications
+FROM case1_finance.loan_application la
+JOIN case1_finance.customer_profile cp ON la.customer_id = cp.customer_id
+WHERE la.quarter = 'Q2'
+GROUP BY la.acquisition_channel, cp.customer_type
+ORDER BY la.acquisition_channel, cp.customer_type;
+
+
+-- ============================================================
+-- PHẦN 5: MARKETING EFFICIENCY (ghép marketing_performance qua channel+quarter)
+-- ============================================================
+
+WITH applications_summary AS (
+    SELECT 
+        la.quarter, la.acquisition_channel AS channel,
+        COUNT(la.application_id) AS applications,
+        SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END) AS approved,
+        ROUND(SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END)::numeric 
+              / COUNT(la.application_id) * 100, 1) AS approval_rate_pct
+    FROM case1_finance.loan_application la
+    LEFT JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+    GROUP BY la.quarter, la.acquisition_channel
+),
+marketing_summary AS (
+    SELECT mp.quarter, mp.channel, SUM(mp.spend) AS total_spend, SUM(mp.leads) AS total_leads
+    FROM case1_finance.marketing_performance mp
+    GROUP BY mp.quarter, mp.channel
+)
+SELECT 
+    a.quarter, a.channel, ms.total_spend, ms.total_leads, a.applications,
+    ROUND(ms.total_spend::numeric / NULLIF(a.applications, 0), 0) AS cost_per_application,
+    a.approved, a.approval_rate_pct,
+    ROUND(ms.total_spend::numeric / NULLIF(a.approved, 0), 0) AS cost_per_approved
+FROM applications_summary a
+LEFT JOIN marketing_summary ms ON a.quarter = ms.quarter AND a.channel = ms.channel
+ORDER BY a.channel, a.quarter;
+
+-- Lead vs Application conversion (kiểm tra leads ≠ applications)
+WITH leads_summary AS (
+    SELECT quarter, channel, SUM(leads) AS total_leads
+    FROM case1_finance.marketing_performance
+    GROUP BY quarter, channel
+),
+applications_summary AS (
+    SELECT quarter, acquisition_channel AS channel, COUNT(application_id) AS total_applications
+    FROM case1_finance.loan_application
+    GROUP BY quarter, acquisition_channel
+)
+SELECT 
+    l.quarter, l.channel, l.total_leads, a.total_applications,
+    ROUND(a.total_applications::numeric / NULLIF(l.total_leads, 0) * 100, 1) AS lead_to_application_rate_pct
+FROM leads_summary l
+JOIN applications_summary a ON l.quarter = a.quarter AND l.channel = a.channel
+ORDER BY l.channel, l.quarter;
+
+
+-- ============================================================
+-- PHẦN 6: DISBURSEMENT RATE Q1/Q2 (làm tròn 2 chữ số)
+-- ============================================================
+
+SELECT 
+    la.quarter,
+    COUNT(DISTINCT CASE WHEN ca.approval_status = 'Approved' THEN la.application_id END) AS total_approved,
+    COUNT(DISTINCT CASE WHEN ca.approval_status = 'Approved' AND ld.disbursed_flag = 1 THEN la.application_id END) AS total_disbursed,
+    ROUND(
+        COUNT(DISTINCT CASE WHEN ca.approval_status = 'Approved' AND ld.disbursed_flag = 1 THEN la.application_id END)::numeric
+        / NULLIF(COUNT(DISTINCT CASE WHEN ca.approval_status = 'Approved' THEN la.application_id END), 0) * 100, 
+    2) AS disbursement_rate_pct
+FROM case1_finance.loan_application la
+LEFT JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+LEFT JOIN case1_finance.loan_disbursement ld ON la.application_id = ld.application_id
+GROUP BY la.quarter
+ORDER BY la.quarter;
+
+
+-- ============================================================
+-- PHẦN 7: OCCUPATION ANALYSIS (bổ sung theo yêu cầu của thầy)
+-- ============================================================
+
+-- Occupation Mix & Approval Rate theo quarter
+SELECT 
+    la.quarter, cp.occupation,
+    COUNT(la.application_id) AS applications,
+    SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END) AS approved,
+    ROUND(SUM(CASE WHEN ca.approval_status = 'Approved' THEN 1 ELSE 0 END)::numeric 
+          / COUNT(la.application_id) * 100, 1) AS approval_rate_pct,
+    ROUND(COUNT(la.application_id)::numeric 
+          / SUM(COUNT(la.application_id)) OVER (PARTITION BY la.quarter) * 100, 1) AS pct_of_quarter
+FROM case1_finance.loan_application la
+JOIN case1_finance.customer_profile cp ON la.customer_id = cp.customer_id
+LEFT JOIN case1_finance.credit_assessment ca ON la.application_id = ca.application_id
+GROUP BY la.quarter, cp.occupation
+ORDER BY cp.occupation, la.quarter;
+
+-- Channel × Occupation (xác nhận TikTok ≈ 100% Student/part-time)
+SELECT 
+    la.acquisition_channel, cp.occupation,
+    COUNT(la.application_id) AS applications,
+    ROUND(COUNT(la.application_id)::numeric 
+          / SUM(COUNT(la.application_id)) OVER (PARTITION BY la.acquisition_channel) * 100, 1) AS pct_within_channel
+FROM case1_finance.loan_application la
+JOIN case1_finance.customer_profile cp ON la.customer_id = cp.customer_id
+WHERE la.quarter = 'Q2'
+GROUP BY la.acquisition_channel, cp.occupation
+ORDER BY la.acquisition_channel, applications DESC;
